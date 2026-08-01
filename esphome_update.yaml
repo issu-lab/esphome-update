@@ -1,88 +1,138 @@
 automation:
-  - alias: "Controlla e aggiorna ESPHome ogni giorno"
-    trigger:
-      - platform: time
+  - id: esphome_update_daily
+    alias: "ESPHome Update — Daily check"
+    description: "Installs available ESPHome device and add-on updates every day."
+    triggers:
+      - trigger: time
         at: "01:00:00"
-    action:
-      - service: script.aggiorna_dispositivi_esphome  # Corretto il nome del servizio
+    actions:
+      - action: script.esphome_update_all
+    mode: single
 
 script:
-  aggiorna_dispositivi_esphome:
-    alias: "🔄 Aggiorna dispositivi ESPHome"
+  esphome_update_all:
+    alias: "ESPHome Update — Install all available updates"
+    description: "Updates ESPHome devices first and the ESPHome add-on last."
     mode: single
     sequence:
-      - alias: "📋 Prepara liste per i risultati"
-        variables:
-          aggiornati_temp: []
-          falliti_temp: []
+      # -----------------------------------------------------------------------
+      # Configuration
+      # -----------------------------------------------------------------------
+      - variables:
+          # Leave empty to disable notifications.
+          # Example: notify.mobile_app_your_phone
+          notification_action: ""
 
-      - alias: "📋 Crea lista dispositivi aggiornabili"
+          # Send a notification even when no update is available.
+          notify_when_no_updates: false
+
+          # Change this only if your ESPHome add-on update entity uses
+          # a different entity ID. Leave empty to exclude the add-on.
+          esphome_addon_entity_id: "update.esphome_update"
+
+          # Maximum time allowed for each update to finish.
+          update_timeout: "00:05:00"
+
+          # Pause between two consecutive updates.
+          delay_between_updates: 5
+
+      - alias: "Find available ESPHome updates"
         variables:
-          dispositivi_esphome: >
+          esphome_device_updates: >-
             {{ states.update
                 | selectattr('state', 'eq', 'on')
                 | selectattr('entity_id', 'in', integration_entities('esphome'))
                 | map(attribute='entity_id')
                 | list }}
-          
-          # Verifica se l'addon ESPHome ha un aggiornamento disponibile
-          esphome_addon_entity_id: "update.esphome_update"
-          esphome_addon: >
-            {% if states(esphome_addon_entity_id) == 'on' %}
-              [ '{{ esphome_addon_entity_id }}' ]
-            {% else %}
-              []
-            {% endif %}
-          
-          entita_da_aggiornare: "{{ dispositivi_esphome + esphome_addon }}"
 
-      - alias: "🔁 Esegui aggiornamenti in sequenza"
+          esphome_addon_updates: >-
+            {% if esphome_addon_entity_id | trim
+                  and states(esphome_addon_entity_id) == 'on' %}
+              {{ [esphome_addon_entity_id] }}
+            {% else %}
+              {{ [] }}
+            {% endif %}
+
+          available_updates: >-
+            {{ (esphome_device_updates + esphome_addon_updates)
+                | unique
+                | list }}
+
+      - alias: "Stop when no update is available"
+        if:
+          - condition: template
+            value_template: "{{ available_updates | length == 0 }}"
+        then:
+          - alias: "Optionally report that everything is current"
+            if:
+              - condition: template
+                value_template: >-
+                  {{ notification_action | trim != ''
+                      and notify_when_no_updates | bool }}
+            then:
+              - action: "{{ notification_action }}"
+                data:
+                  title: "ESPHome Update"
+                  message: "All ESPHome devices and components are up to date."
+
+          - stop: "No ESPHome updates available."
+
+      - alias: "Initialize result lists"
+        variables:
+          updated_entities: []
+          failed_entities: []
+
+      - alias: "Install updates sequentially"
         repeat:
-          for_each: "{{ entita_da_aggiornare }}"
+          for_each: "{{ available_updates }}"
           sequence:
             - variables:
-                dispositivo_corrente: "{{ repeat.item }}"
-                nome_dispositivo: "{{ state_attr(repeat.item, 'friendly_name') or repeat.item }}"
-            
-            - service: update.install
+                current_entity: "{{ repeat.item }}"
+                current_name: >-
+                  {{ state_attr(repeat.item, 'friendly_name') or repeat.item }}
+
+            - alias: "Install current update"
+              action: update.install
               target:
-                entity_id: "{{ dispositivo_corrente }}"
-              data: {}
+                entity_id: "{{ current_entity }}"
               continue_on_error: true
-            
-            - wait_template: "{{ is_state(dispositivo_corrente, 'off') }}"
-              timeout: "00:03:00"
+
+            - alias: "Wait for the update to complete"
+              wait_template: "{{ is_state(current_entity, 'off') }}"
+              timeout: "{{ update_timeout }}"
               continue_on_timeout: true
-            
-            - choose:
-                - conditions:
-                    - condition: template
-                      value_template: "{{ is_state(dispositivo_corrente, 'off') }}"
-                  sequence:
-                    - variables:
-                        aggiornati_temp: "{{ aggiornati_temp + [nome_dispositivo] }}"
-              default:
+
+            - alias: "Record the result"
+              if:
+                - condition: template
+                  value_template: "{{ is_state(current_entity, 'off') }}"
+              then:
                 - variables:
-                    falliti_temp: "{{ falliti_temp + [nome_dispositivo] }}"
-            
-            - delay: "00:00:05"
-      
-      - alias: "📱 Invia notifica finale"
-        # Sostituisci con il tuo servizio di notifica reale
-        service: notify.mobile_app_tuo_telefono
-        data:
-          title: "🔄 Aggiornamento ESPHome"
-          message: >
-            {% if aggiornati_temp or falliti_temp %}
-              {% if aggiornati_temp %}
-                ✅ Aggiornati con successo:
-                {{ aggiornati_temp | join('\n') }}
-              {% endif %}
-              {% if falliti_temp %}
-                
-                ❌ Falliti:
-                {{ falliti_temp | join('\n') }}
-              {% endif %}
-            {% else %}
-              ℹ️ Nessun aggiornamento disponibile.
-            {% endif %}
+                    updated_entities: >-
+                      {{ updated_entities + [current_name] }}
+              else:
+                - variables:
+                    failed_entities: >-
+                      {{ failed_entities + [current_name] }}
+
+            - delay:
+                seconds: "{{ delay_between_updates }}"
+
+      - alias: "Optionally send the final result"
+        if:
+          - condition: template
+            value_template: "{{ notification_action | trim != '' }}"
+        then:
+          - action: "{{ notification_action }}"
+            data:
+              title: "ESPHome Update"
+              message: >-
+                {% if updated_entities %}
+                Updated successfully:
+                {{ updated_entities | join('\n') }}
+                {% endif %}
+                {% if failed_entities %}
+                {% if updated_entities %}{{ '\n\n' }}{% endif %}
+                Failed or timed out:
+                {{ failed_entities | join('\n') }}
+                {% endif %}
